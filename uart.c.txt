@@ -1,58 +1,145 @@
 #include "uart_cmd.h"
 
+// --- Shared receive buffer ---
 volatile char rcv_buf[5];
 volatile char rcv_data;
+volatile int  rcv_success = 1;
+volatile int  finish      = 1;
+volatile int  rcv_cnt     = 0;   // kept for compatibility
 
-volatile int rcv_success=1, finish=1; // finish는 main에서 쓸 수 있으나 원본 유지
-volatile int rcv_cnt = 0;
+// --- Packet buffer & parser state ---
+volatile char pkt_buf[BT_PKT_LEN];
+volatile int  pkt_state = PKT_STATE_WAIT_STX;
 
+// ============================================================
+// uart_cmd_init()
+//   - Enable UART receive interrupt
+// ============================================================
 void uart_cmd_init(void)
 {
   enable_interrupts(int_rda);
   enable_interrupts(global);
 }
 
+// ============================================================
+// rda_isr()  -  UART Receive Interrupt Handler
+//   - Passes every incoming byte to parse_bt_packet()
+//   - On a complete, valid packet: copies payload to rcv_buf[]
+//     and sets rcv_success = 0 to wake up the main loop
+// ============================================================
 #int_rda
 void rda_isr()
 {
   rcv_data = getc();
 
-  switch(rcv_cnt)
+  if(parse_bt_packet(rcv_data))
   {
-     case 0:
-        if(rcv_data == 'F'|| rcv_data == 'B' || rcv_data == 'S'
-        || rcv_data == 'R' || rcv_data == 'L' || rcv_data == 'C'
-        || rcv_data == 'Q' || rcv_data == 'P' || rcv_data == 'Y')
-        {
-           rcv_buf[rcv_cnt] = rcv_data;
-           rcv_cnt = 1;
-        }
-        break;
-
-     case 1 :
-        if((rcv_data >= '0' && rcv_data <= '9') || rcv_data =='F' || rcv_data =='L')
-        {
-           rcv_buf[rcv_cnt] = rcv_data;
-           rcv_cnt = 2;
-        }
-        break;
-
-     case 2 :
-        if((rcv_data >= '0' && rcv_data <= '9') || rcv_data =='F' || rcv_data =='L')
-        {
-           rcv_buf[rcv_cnt] = rcv_data;
-           rcv_cnt = 3;
-        }
-        break;
-
-     case 3 :
-        if((rcv_data >= '0' && rcv_data <= '9') || rcv_data =='F' || rcv_data =='L')
-        {
-           rcv_buf[rcv_cnt] = rcv_data;
-           rcv_success = 0;
-        }
-        rcv_cnt = 0;
-        rcv_data = 0;
-        break;
+    rcv_buf[0] = pkt_buf[PKT_CMD];
+    rcv_buf[1] = pkt_buf[PKT_PARAM1];
+    rcv_buf[2] = pkt_buf[PKT_PARAM2];
+    rcv_buf[3] = pkt_buf[PKT_PARAM3];
+    rcv_success = 0;   // Signal main loop: new command ready
   }
+}
+
+// ============================================================
+// parse_bt_packet()
+//   - State-machine parser for the 7-byte BT packet
+//   - Called once per received byte
+//   - Returns 1 only when a full, checksum-verified packet
+//     with correct STX/ETX has been assembled
+//   - Automatically resets to WAIT_STX on any error
+//
+//  State flow:
+//  WAIT_STX -> CMD -> PARAM1 -> PARAM2 -> PARAM3
+//           -> CHECKSUM -> WAIT_ETX -> (done / reset)
+// ============================================================
+int parse_bt_packet(char rx_byte)
+{
+  switch(pkt_state)
+  {
+    // ---- Wait for Header (STX = 0xAA) ----
+    case PKT_STATE_WAIT_STX:
+      if((unsigned char)rx_byte == BT_STX)
+      {
+        pkt_buf[PKT_STX] = rx_byte;
+        pkt_state = PKT_STATE_CMD;
+      }
+      break;
+
+    // ---- Command byte : F/B/R/L/S/Q/P/C/Y ----
+    case PKT_STATE_CMD:
+      if(rx_byte == 'F' || rx_byte == 'B' || rx_byte == 'S' ||
+         rx_byte == 'R' || rx_byte == 'L' || rx_byte == 'C' ||
+         rx_byte == 'Q' || rx_byte == 'P' || rx_byte == 'Y')
+      {
+        pkt_buf[PKT_CMD] = rx_byte;
+        pkt_state = PKT_STATE_PARAM1;
+      }
+      else
+      {
+        pkt_state = PKT_STATE_WAIT_STX;   // Invalid CMD -> reset
+      }
+      break;
+
+    // ---- PARAM1 ----
+    case PKT_STATE_PARAM1:
+      pkt_buf[PKT_PARAM1] = rx_byte;
+      pkt_state = PKT_STATE_PARAM2;
+      break;
+
+    // ---- PARAM2 ----
+    case PKT_STATE_PARAM2:
+      pkt_buf[PKT_PARAM2] = rx_byte;
+      pkt_state = PKT_STATE_PARAM3;
+      break;
+
+    // ---- PARAM3 ----
+    case PKT_STATE_PARAM3:
+      pkt_buf[PKT_PARAM3] = rx_byte;
+      pkt_state = PKT_STATE_CHECKSUM;
+      break;
+
+    // ---- CHECKSUM : store, verify in ETX step ----
+    case PKT_STATE_CHECKSUM:
+      pkt_buf[PKT_CHECKSUM] = rx_byte;
+      pkt_state = PKT_STATE_WAIT_ETX;
+      break;
+
+    // ---- Tail (ETX = 0x55) + final validation ----
+    case PKT_STATE_WAIT_ETX:
+      pkt_state = PKT_STATE_WAIT_STX;    // Always reset after ETX step
+      if((unsigned char)rx_byte == BT_ETX)
+      {
+        pkt_buf[PKT_ETX] = rx_byte;
+
+        // XOR checksum verification
+        if(pkt_buf[PKT_CHECKSUM] == calc_checksum(pkt_buf[PKT_CMD],
+                                                   pkt_buf[PKT_PARAM1],
+                                                   pkt_buf[PKT_PARAM2],
+                                                   pkt_buf[PKT_PARAM3]))
+        {
+          return 1;   // Valid packet!
+        }
+        // Checksum mismatch: silently discard
+      }
+      break;
+
+    default:
+      pkt_state = PKT_STATE_WAIT_STX;
+      break;
+  }
+
+  return 0;   // Packet not yet complete
+}
+
+// ============================================================
+// calc_checksum()
+//   - XOR of the 4 payload bytes (CMD ^ P1 ^ P2 ^ P3)
+//   - Use on both transmit (to build checksum) and
+//     receive (to verify checksum) sides
+// ============================================================
+char calc_checksum(char cmd, char p1, char p2, char p3)
+{
+  return (cmd ^ p1 ^ p2 ^ p3);
 }
