@@ -3,11 +3,59 @@
 
 #include "config.h"
 
+// ============================================================
+// [BT Packet Structure]  -  7 bytes fixed length
+//
+//  Byte 0  : STX      = 0xAA          (Header)
+//  Byte 1  : CMD      = F/B/R/L/S/Q/P/C/Y
+//  Byte 2  : PARAM1
+//  Byte 3  : PARAM2
+//  Byte 4  : PARAM3
+//  Byte 5  : CHECKSUM = CMD ^ P1 ^ P2 ^ P3  (XOR)
+//  Byte 6  : ETX      = 0x55          (Tail)
+//
+//  Example) Forward / continuous / duration 3 / speed 2 :
+//  [ 0xAA ][ 'F' ][ '0' ][ '2' ][ '2' ][ CHK ][ 0x55 ]
+// ============================================================
+
+// --- Packet delimiter ---
+#define BT_STX          0xAA    // Start of packet
+#define BT_ETX          0x55    // End of packet
+#define BT_PKT_LEN      7       // Total packet byte length
+
+// --- Field index in pkt_buf[] ---
+#define PKT_STX         0
+#define PKT_CMD         1
+#define PKT_PARAM1      2
+#define PKT_PARAM2      3
+#define PKT_PARAM3      4
+#define PKT_CHECKSUM    5
+#define PKT_ETX         6
+
+// --- Parser state machine values ---
+#define PKT_STATE_WAIT_STX   0
+#define PKT_STATE_CMD        1
+#define PKT_STATE_PARAM1     2
+#define PKT_STATE_PARAM2     3
+#define PKT_STATE_PARAM3     4
+#define PKT_STATE_CHECKSUM   5
+#define PKT_STATE_WAIT_ETX   6
+
+// --- Shared receive buffer (CMD + 3 params) ---
+// rcv_buf[0] = CMD, [1] = PARAM1, [2] = PARAM2, [3] = PARAM3
 extern volatile char rcv_buf[5];
 extern volatile char rcv_data;
-extern volatile int rcv_success;
-extern volatile int rcv_cnt;
+extern volatile int  rcv_success;
+extern volatile int  rcv_cnt;       // kept for compatibility
 
+// --- Full raw packet buffer ---
+extern volatile char pkt_buf[BT_PKT_LEN];
+extern volatile int  pkt_state;
+
+// --- Public API ---
 void uart_cmd_init(void);
+int  parse_bt_packet(char rx_byte);          // Returns 1 on valid packet
+char calc_checksum(char cmd, char p1,
+                   char p2, char p3);        // XOR checksum helper
 
 #endif
